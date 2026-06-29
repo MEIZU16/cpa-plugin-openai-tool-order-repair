@@ -6,7 +6,7 @@
       "name": "OpenAI Tool Order Repair",
       "description": "Repairs OpenAI-compatible tool output ordering before upstream execution, helping Cursor keep assistant tool calls before matching tool results.",
       "author": "MEIZU16",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "repository": "https://github.com/MEIZU16/cpa-plugin-openai-tool-order-repair",
       "homepage": "https://github.com/MEIZU16/cpa-plugin-openai-tool-order-repair",
       "license": "MIT",

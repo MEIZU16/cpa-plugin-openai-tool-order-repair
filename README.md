@@ -53,6 +53,43 @@ plugins:
 Restart CLIProxyAPI, then install `OpenAI Tool Order Repair` from the plugin
 store UI.
 
+## Debug logging
+
+Version `0.1.1` adds optional JSONL debug logging for request interception,
+non-streaming responses, and streaming response chunks.
+
+Example configuration:
+
+```yaml
+plugins:
+  configs:
+    openai-tool-order-repair:
+      enabled: true
+      priority: 1
+      debug: true
+      debug_log_path: "logs/openai-tool-order-repair-debug.jsonl"
+      debug_include_body: true
+      debug_log_stream_chunks: true
+      debug_max_body_bytes: 262144
+```
+
+The default log path is relative to the CLIProxyAPI working directory. In the
+official Docker image that usually means:
+
+```text
+/CLIProxyAPI/logs/openai-tool-order-repair-debug.jsonl
+```
+
+If `./logs` is mounted to `/CLIProxyAPI/logs`, the file will be available on the
+host at:
+
+```text
+./logs/openai-tool-order-repair-debug.jsonl
+```
+
+Warning: `debug_include_body: true` may record prompts, responses, headers, and
+tool payloads. Disable it or reduce `debug_max_body_bytes` when sharing logs.
+
 ## Build locally
 
 ```bash
@@ -69,7 +106,7 @@ openai-tool-order-repair_<version>_<goos>_<goarch>.zip
 checksums.txt
 ```
 
-For Linux amd64 version `0.1.0`, the zip must contain this file at the zip root:
+For Linux amd64 version `0.1.1`, the zip must contain this file at the zip root:
 
 ```text
 openai-tool-order-repair.so
@@ -78,5 +115,5 @@ openai-tool-order-repair.so
 Create release assets with:
 
 ```bash
-./scripts/package_release.sh 0.1.0 linux amd64
+./scripts/package_release.sh 0.1.1 linux amd64
 ```

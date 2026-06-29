@@ -47,10 +47,43 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 	"unsafe"
 )
 
 const abiVersion uint32 = 1
+
+const (
+	pluginID            = "openai-tool-order-repair"
+	pluginVersion       = "0.1.1"
+	defaultDebugLogPath = "logs/openai-tool-order-repair-debug.jsonl"
+	defaultMaxBodyBytes = 256 * 1024
+)
+
+var debugMu sync.Mutex
+var debugConfig = debugSettings{
+	LogPath:         defaultDebugLogPath,
+	IncludeBody:     true,
+	LogStreamChunks: true,
+	MaxBodyBytes:    defaultMaxBodyBytes,
+}
+
+type debugSettings struct {
+	Enabled         bool
+	LogPath         string
+	IncludeBody     bool
+	LogStreamChunks bool
+	MaxBodyBytes    int
+}
+
+type pluginConfigRequest struct {
+	Config map[string]any `json:"config"`
+}
 
 type envelope struct {
 	OK     bool            `json:"ok"`
@@ -64,13 +97,74 @@ type envelopeError struct {
 }
 
 type interceptRequest struct {
-	SourceFormat string          `json:"SourceFormat"`
-	ToFormat     string          `json:"ToFormat"`
-	Body         json.RawMessage `json:"Body"`
+	SourceFormat   string              `json:"SourceFormat"`
+	ToFormat       string              `json:"ToFormat"`
+	Model          string              `json:"Model"`
+	RequestedModel string              `json:"RequestedModel"`
+	Stream         bool                `json:"Stream"`
+	Headers        map[string][]string `json:"Headers"`
+	Body           json.RawMessage     `json:"Body"`
+	Metadata       map[string]any      `json:"Metadata"`
 }
 
 type interceptResponse struct {
 	Body []byte `json:"Body,omitempty"`
+}
+
+type responseInterceptRequest struct {
+	SourceFormat    string              `json:"SourceFormat"`
+	Model           string              `json:"Model"`
+	RequestedModel  string              `json:"RequestedModel"`
+	Stream          bool                `json:"Stream"`
+	RequestHeaders  map[string][]string `json:"RequestHeaders"`
+	ResponseHeaders map[string][]string `json:"ResponseHeaders"`
+	OriginalRequest json.RawMessage     `json:"OriginalRequest"`
+	RequestBody     json.RawMessage     `json:"RequestBody"`
+	Body            json.RawMessage     `json:"Body"`
+	StatusCode      int                 `json:"StatusCode"`
+	Metadata        map[string]any      `json:"Metadata"`
+}
+
+type responseInterceptResponse struct{}
+
+type streamChunkInterceptRequest struct {
+	SourceFormat    string              `json:"SourceFormat"`
+	Model           string              `json:"Model"`
+	RequestedModel  string              `json:"RequestedModel"`
+	RequestHeaders  map[string][]string `json:"RequestHeaders"`
+	ResponseHeaders map[string][]string `json:"ResponseHeaders"`
+	OriginalRequest json.RawMessage     `json:"OriginalRequest"`
+	RequestBody     json.RawMessage     `json:"RequestBody"`
+	Body            json.RawMessage     `json:"Body"`
+	HistoryChunks   []json.RawMessage   `json:"HistoryChunks"`
+	ChunkIndex      int                 `json:"ChunkIndex"`
+	Metadata        map[string]any      `json:"Metadata"`
+}
+
+type streamChunkInterceptResponse struct{}
+
+type debugRecord struct {
+	Time              string              `json:"time"`
+	Event             string              `json:"event"`
+	SourceFormat      string              `json:"source_format,omitempty"`
+	ToFormat          string              `json:"to_format,omitempty"`
+	Model             string              `json:"model,omitempty"`
+	RequestedModel    string              `json:"requested_model,omitempty"`
+	Stream            bool                `json:"stream,omitempty"`
+	StatusCode        int                 `json:"status_code,omitempty"`
+	ChunkIndex        int                 `json:"chunk_index,omitempty"`
+	HistoryChunkCount int                 `json:"history_chunk_count,omitempty"`
+	Changed           bool                `json:"changed,omitempty"`
+	BodyBytes         int                 `json:"body_bytes,omitempty"`
+	RepairedBodyBytes int                 `json:"repaired_body_bytes,omitempty"`
+	RequestHeaders    map[string][]string `json:"request_headers,omitempty"`
+	ResponseHeaders   map[string][]string `json:"response_headers,omitempty"`
+	Body              any                 `json:"body,omitempty"`
+	RepairedBody      any                 `json:"repaired_body,omitempty"`
+	OriginalRequest   any                 `json:"original_request,omitempty"`
+	RequestBody       any                 `json:"request_body,omitempty"`
+	Error             string              `json:"error,omitempty"`
+	Metadata          map[string]any      `json:"metadata,omitempty"`
 }
 
 type messageMeta struct {
@@ -138,16 +232,61 @@ func cliproxyPluginShutdown() {}
 
 func handleMethod(method string, rawRequest []byte) ([]byte, error) {
 	switch method {
-	case "plugin.register", "plugin.reconfigure":
-		return okEnvelopeJSON(`{"schema_version":1,"metadata":{"Name":"openai-tool-order-repair","Version":"0.1.0","Author":"MEIZU16","GitHubRepository":"https://github.com/MEIZU16/cpa-plugin-openai-tool-order-repair","Logo":"","ConfigFields":[]},"capabilities":{"request_interceptor":true}}`)
+	case "plugin.register":
+		return pluginRegistration()
+	case "plugin.reconfigure":
+		applyDebugConfig(rawRequest)
+		return pluginRegistration()
 	case "request.intercept_before", "request.intercept_after":
-		return interceptOpenAIRequest(rawRequest)
+		return interceptOpenAIRequest(method, rawRequest)
+	case "response.intercept_after":
+		return interceptOpenAIResponse(rawRequest)
+	case "response.intercept_stream_chunk":
+		return interceptOpenAIStreamChunk(rawRequest)
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
 }
 
-func interceptOpenAIRequest(rawRequest []byte) ([]byte, error) {
+func pluginRegistration() ([]byte, error) {
+	return okEnvelopeJSON(`{"schema_version":1,"metadata":{"Name":"openai-tool-order-repair","Version":"` + pluginVersion + `","Author":"MEIZU16","GitHubRepository":"https://github.com/MEIZU16/cpa-plugin-openai-tool-order-repair","Logo":"","ConfigFields":[{"Name":"debug","Type":"boolean","Description":"Write detailed request and response debug records."},{"Name":"debug_log_path","Type":"string","Description":"Path for JSONL debug records. Relative paths are resolved from the CLIProxyAPI working directory."},{"Name":"debug_include_body","Type":"boolean","Description":"Include request and response bodies in debug records. Sensitive data may be logged."},{"Name":"debug_log_stream_chunks","Type":"boolean","Description":"Log streaming response chunks when debug is enabled."},{"Name":"debug_max_body_bytes","Type":"integer","Description":"Maximum bytes stored for each logged body field."}]},"capabilities":{"request_interceptor":true,"response_interceptor":true,"response_stream_interceptor":true}}`)
+}
+
+func applyDebugConfig(rawRequest []byte) {
+	settings := debugSettings{
+		LogPath:         defaultDebugLogPath,
+		IncludeBody:     true,
+		LogStreamChunks: true,
+		MaxBodyBytes:    defaultMaxBodyBytes,
+	}
+
+	var req pluginConfigRequest
+	if len(rawRequest) > 0 {
+		_ = json.Unmarshal(rawRequest, &req)
+	}
+	config := req.Config
+	if len(config) == 0 {
+		var raw map[string]any
+		if err := json.Unmarshal(rawRequest, &raw); err == nil {
+			config = raw
+		}
+	}
+
+	settings.Enabled = boolConfig(config, "debug", false)
+	settings.LogPath = stringConfig(config, "debug_log_path", defaultDebugLogPath)
+	settings.IncludeBody = boolConfig(config, "debug_include_body", true)
+	settings.LogStreamChunks = boolConfig(config, "debug_log_stream_chunks", true)
+	settings.MaxBodyBytes = intConfig(config, "debug_max_body_bytes", defaultMaxBodyBytes)
+	if settings.MaxBodyBytes <= 0 {
+		settings.MaxBodyBytes = defaultMaxBodyBytes
+	}
+
+	debugMu.Lock()
+	debugConfig = settings
+	debugMu.Unlock()
+}
+
+func interceptOpenAIRequest(event string, rawRequest []byte) ([]byte, error) {
 	var req interceptRequest
 	if len(rawRequest) == 0 {
 		return nil, errors.New("request payload is required")
@@ -158,21 +297,142 @@ func interceptOpenAIRequest(rawRequest []byte) ([]byte, error) {
 
 	body, errDecode := decodeBody(req.Body)
 	if errDecode != nil {
+		appendDebugRecord(debugRecord{
+			Event:          event,
+			SourceFormat:   req.SourceFormat,
+			ToFormat:       req.ToFormat,
+			Model:          req.Model,
+			RequestedModel: req.RequestedModel,
+			Stream:         req.Stream,
+			RequestHeaders: req.Headers,
+			Error:          "decode request body: " + errDecode.Error(),
+			Metadata:       req.Metadata,
+		})
 		return nil, fmt.Errorf("decode request body: %w", errDecode)
 	}
 	if len(body) == 0 || !json.Valid(body) {
+		appendDebugRecord(debugRecord{
+			Event:          event,
+			SourceFormat:   req.SourceFormat,
+			ToFormat:       req.ToFormat,
+			Model:          req.Model,
+			RequestedModel: req.RequestedModel,
+			Stream:         req.Stream,
+			BodyBytes:      len(body),
+			RequestHeaders: req.Headers,
+			Body:           debugBodyValue(body),
+			Error:          "empty or invalid JSON request body",
+			Metadata:       req.Metadata,
+		})
 		return okEnvelopeValue(interceptResponse{})
 	}
 
 	repaired, changed, errRepair := repairOpenAIToolMessageOrder(body)
 	if errRepair != nil {
+		appendDebugRecord(debugRecord{
+			Event:          event,
+			SourceFormat:   req.SourceFormat,
+			ToFormat:       req.ToFormat,
+			Model:          req.Model,
+			RequestedModel: req.RequestedModel,
+			Stream:         req.Stream,
+			BodyBytes:      len(body),
+			RequestHeaders: req.Headers,
+			Body:           debugBodyValue(body),
+			Error:          "repair request body: " + errRepair.Error(),
+			Metadata:       req.Metadata,
+		})
 		return nil, errRepair
 	}
+
+	appendDebugRecord(debugRecord{
+		Event:             event,
+		SourceFormat:      req.SourceFormat,
+		ToFormat:          req.ToFormat,
+		Model:             req.Model,
+		RequestedModel:    req.RequestedModel,
+		Stream:            req.Stream,
+		Changed:           changed,
+		BodyBytes:         len(body),
+		RepairedBodyBytes: len(repaired),
+		RequestHeaders:    req.Headers,
+		Body:              debugBodyValue(body),
+		RepairedBody:      debugBodyValue(repaired),
+		Metadata:          req.Metadata,
+	})
+
 	if !changed {
 		return okEnvelopeValue(interceptResponse{})
 	}
 
 	return okEnvelopeValue(interceptResponse{Body: repaired})
+}
+
+func interceptOpenAIResponse(rawRequest []byte) ([]byte, error) {
+	var req responseInterceptRequest
+	if err := json.Unmarshal(rawRequest, &req); err != nil {
+		return nil, fmt.Errorf("decode response intercept request: %w", err)
+	}
+
+	body, bodyErr := decodeBody(req.Body)
+	originalRequest, _ := decodeBody(req.OriginalRequest)
+	requestBody, _ := decodeBody(req.RequestBody)
+	record := debugRecord{
+		Event:           "response.intercept_after",
+		SourceFormat:    req.SourceFormat,
+		Model:           req.Model,
+		RequestedModel:  req.RequestedModel,
+		Stream:          req.Stream,
+		StatusCode:      req.StatusCode,
+		BodyBytes:       len(body),
+		RequestHeaders:  req.RequestHeaders,
+		ResponseHeaders: req.ResponseHeaders,
+		Body:            debugBodyValue(body),
+		OriginalRequest: debugBodyValue(originalRequest),
+		RequestBody:     debugBodyValue(requestBody),
+		Metadata:        req.Metadata,
+	}
+	if bodyErr != nil {
+		record.Error = "decode response body: " + bodyErr.Error()
+	}
+	appendDebugRecord(record)
+	return okEnvelopeValue(responseInterceptResponse{})
+}
+
+func interceptOpenAIStreamChunk(rawRequest []byte) ([]byte, error) {
+	var req streamChunkInterceptRequest
+	if err := json.Unmarshal(rawRequest, &req); err != nil {
+		return nil, fmt.Errorf("decode stream chunk intercept request: %w", err)
+	}
+
+	settings := currentDebugSettings()
+	if settings.Enabled && !settings.LogStreamChunks && req.ChunkIndex >= 0 {
+		return okEnvelopeValue(streamChunkInterceptResponse{})
+	}
+
+	body, bodyErr := decodeBody(req.Body)
+	originalRequest, _ := decodeBody(req.OriginalRequest)
+	requestBody, _ := decodeBody(req.RequestBody)
+	record := debugRecord{
+		Event:             "response.intercept_stream_chunk",
+		SourceFormat:      req.SourceFormat,
+		Model:             req.Model,
+		RequestedModel:    req.RequestedModel,
+		ChunkIndex:        req.ChunkIndex,
+		HistoryChunkCount: len(req.HistoryChunks),
+		BodyBytes:         len(body),
+		RequestHeaders:    req.RequestHeaders,
+		ResponseHeaders:   req.ResponseHeaders,
+		Body:              debugBodyValue(body),
+		OriginalRequest:   debugBodyValue(originalRequest),
+		RequestBody:       debugBodyValue(requestBody),
+		Metadata:          req.Metadata,
+	}
+	if bodyErr != nil {
+		record.Error = "decode stream chunk body: " + bodyErr.Error()
+	}
+	appendDebugRecord(record)
+	return okEnvelopeValue(streamChunkInterceptResponse{})
 }
 
 func decodeBody(raw json.RawMessage) ([]byte, error) {
@@ -344,6 +604,141 @@ func getAssistantToolCallIDs(meta messageMeta) []string {
 		}
 	}
 	return ids
+}
+
+func boolConfig(config map[string]any, key string, fallback bool) bool {
+	if config == nil {
+		return fallback
+	}
+	v, ok := config[key]
+	if !ok {
+		return fallback
+	}
+	switch typed := v.(type) {
+	case bool:
+		return typed
+	case string:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(typed))
+		if err == nil {
+			return parsed
+		}
+	case float64:
+		return typed != 0
+	case json.Number:
+		parsed, err := typed.Int64()
+		if err == nil {
+			return parsed != 0
+		}
+	}
+	return fallback
+}
+
+func stringConfig(config map[string]any, key string, fallback string) string {
+	if config == nil {
+		return fallback
+	}
+	v, ok := config[key]
+	if !ok {
+		return fallback
+	}
+	if typed, ok := v.(string); ok && strings.TrimSpace(typed) != "" {
+		return strings.TrimSpace(typed)
+	}
+	return fallback
+}
+
+func intConfig(config map[string]any, key string, fallback int) int {
+	if config == nil {
+		return fallback
+	}
+	v, ok := config[key]
+	if !ok {
+		return fallback
+	}
+	switch typed := v.(type) {
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	case json.Number:
+		parsed, err := typed.Int64()
+		if err == nil {
+			return int(parsed)
+		}
+	case string:
+		parsed, err := strconv.Atoi(strings.TrimSpace(typed))
+		if err == nil {
+			return parsed
+		}
+	}
+	return fallback
+}
+
+func currentDebugSettings() debugSettings {
+	debugMu.Lock()
+	settings := debugConfig
+	debugMu.Unlock()
+	if settings.LogPath == "" {
+		settings.LogPath = defaultDebugLogPath
+	}
+	if settings.MaxBodyBytes <= 0 {
+		settings.MaxBodyBytes = defaultMaxBodyBytes
+	}
+	return settings
+}
+
+func appendDebugRecord(record debugRecord) {
+	settings := currentDebugSettings()
+	if !settings.Enabled {
+		return
+	}
+	if record.Time == "" {
+		record.Time = time.Now().Format(time.RFC3339Nano)
+	}
+
+	raw, err := json.Marshal(record)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s debug marshal error: %v\n", pluginID, err)
+		return
+	}
+
+	debugMu.Lock()
+	defer debugMu.Unlock()
+	if err := os.MkdirAll(filepath.Dir(settings.LogPath), 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "%s debug mkdir error: %v\n", pluginID, err)
+		return
+	}
+	file, err := os.OpenFile(settings.LogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s debug open error: %v\n", pluginID, err)
+		return
+	}
+	defer file.Close()
+	if _, err := file.Write(append(raw, '\n')); err != nil {
+		fmt.Fprintf(os.Stderr, "%s debug write error: %v\n", pluginID, err)
+	}
+}
+
+func debugBodyValue(body []byte) any {
+	settings := currentDebugSettings()
+	if !settings.Enabled || !settings.IncludeBody || len(body) == 0 {
+		return nil
+	}
+	if len(body) > settings.MaxBodyBytes {
+		return map[string]any{
+			"truncated": true,
+			"bytes":     len(body),
+			"prefix":    string(body[:settings.MaxBodyBytes]),
+		}
+	}
+
+	var parsed any
+	if json.Unmarshal(body, &parsed) == nil {
+		return parsed
+	}
+	return string(body)
 }
 
 func okEnvelopeJSON(result string) ([]byte, error) {
