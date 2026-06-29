@@ -55,13 +55,15 @@ import (
 	"sync"
 	"time"
 	"unsafe"
+
+	"gopkg.in/yaml.v3"
 )
 
 const abiVersion uint32 = 1
 
 const (
 	pluginID            = "openai-tool-order-repair"
-	pluginVersion       = "0.1.2"
+	pluginVersion       = "0.1.3"
 	defaultDebugLogPath = "logs/openai-tool-order-repair-debug.jsonl"
 	defaultMaxBodyBytes = 256 * 1024
 	debugPanelTailBytes = 512 * 1024
@@ -90,7 +92,8 @@ type debugSettings struct {
 }
 
 type pluginConfigRequest struct {
-	Config map[string]any `json:"config"`
+	Config     map[string]any `json:"config"`
+	ConfigYAML []byte         `json:"config_yaml"`
 }
 
 type envelope struct {
@@ -265,6 +268,7 @@ func cliproxyPluginShutdown() {}
 func handleMethod(method string, rawRequest []byte) ([]byte, error) {
 	switch method {
 	case "plugin.register":
+		applyDebugConfig(rawRequest)
 		return pluginRegistration()
 	case "plugin.reconfigure":
 		applyDebugConfig(rawRequest)
@@ -332,6 +336,9 @@ func applyDebugConfig(rawRequest []byte) {
 		_ = json.Unmarshal(rawRequest, &req)
 	}
 	config := req.Config
+	if len(config) == 0 && len(req.ConfigYAML) > 0 {
+		config = configMapFromYAML(req.ConfigYAML)
+	}
 	if len(config) == 0 {
 		var raw map[string]any
 		if err := json.Unmarshal(rawRequest, &raw); err == nil {
@@ -351,6 +358,14 @@ func applyDebugConfig(rawRequest []byte) {
 	debugMu.Lock()
 	debugConfig = settings
 	debugMu.Unlock()
+}
+
+func configMapFromYAML(raw []byte) map[string]any {
+	var config map[string]any
+	if err := yaml.Unmarshal(raw, &config); err != nil {
+		return nil
+	}
+	return config
 }
 
 func interceptOpenAIRequest(event string, rawRequest []byte) ([]byte, error) {

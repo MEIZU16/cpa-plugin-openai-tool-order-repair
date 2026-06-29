@@ -136,6 +136,45 @@ func TestManagementPanelRegistersAndRenders(t *testing.T) {
 	}
 }
 
+func TestApplyDebugConfigReadsLifecycleConfigYAML(t *testing.T) {
+	previous := currentDebugSettings()
+	t.Cleanup(func() {
+		debugMu.Lock()
+		debugConfig = previous
+		debugMu.Unlock()
+	})
+
+	raw, err := json.Marshal(pluginConfigRequest{ConfigYAML: []byte(`enabled: true
+priority: 0
+debug: true
+debug_log_path: "logs/from-yaml.jsonl"
+debug_include_body: false
+debug_log_stream_chunks: false
+debug_max_body_bytes: 123
+`)})
+	if err != nil {
+		t.Fatalf("marshal lifecycle config: %v", err)
+	}
+
+	applyDebugConfig(raw)
+	settings := currentDebugSettings()
+	if !settings.Enabled {
+		t.Fatal("debug Enabled = false, want true")
+	}
+	if settings.LogPath != "logs/from-yaml.jsonl" {
+		t.Fatalf("LogPath = %q, want logs/from-yaml.jsonl", settings.LogPath)
+	}
+	if settings.IncludeBody {
+		t.Fatal("IncludeBody = true, want false")
+	}
+	if settings.LogStreamChunks {
+		t.Fatal("LogStreamChunks = true, want false")
+	}
+	if settings.MaxBodyBytes != 123 {
+		t.Fatalf("MaxBodyBytes = %d, want 123", settings.MaxBodyBytes)
+	}
+}
+
 func decodeTestMessages(t *testing.T, body []byte) []messageMeta {
 	t.Helper()
 

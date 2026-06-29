@@ -100,6 +100,9 @@ The panel shows the current debug settings, the configured log path, the recent
 tail of the JSONL log file, and a button to clear the log. It reads at most the
 last 512 KiB of the log file to avoid loading very large logs into the browser.
 
+Version `0.1.3` fixes reading debug settings from the `config_yaml` lifecycle
+payload sent by CLIProxyAPI, so the panel reflects the saved `debug` switch.
+
 ## Build locally
 
 ```bash
@@ -116,7 +119,7 @@ openai-tool-order-repair_<version>_<goos>_<goarch>.zip
 checksums.txt
 ```
 
-For Linux amd64 version `0.1.2`, the zip must contain this file at the zip root:
+For Linux amd64 version `0.1.3`, the zip must contain this file at the zip root:
 
 ```text
 openai-tool-order-repair.so
@@ -125,5 +128,5 @@ openai-tool-order-repair.so
 Create release assets with:
 
 ```bash
-./scripts/package_release.sh 0.1.2 linux amd64
+./scripts/package_release.sh 0.1.3 linux amd64
 ```
