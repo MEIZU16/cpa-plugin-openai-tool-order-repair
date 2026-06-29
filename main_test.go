@@ -149,7 +149,7 @@ priority: 0
 debug: true
 debug_log_path: "logs/from-yaml.jsonl"
 debug_include_body: false
-debug_log_stream_chunks: false
+debug_log_stream_chunks: true
 debug_max_body_bytes: 123
 `)})
 	if err != nil {
@@ -168,7 +168,7 @@ debug_max_body_bytes: 123
 		t.Fatal("IncludeBody = true, want false")
 	}
 	if settings.LogStreamChunks {
-		t.Fatal("LogStreamChunks = true, want false")
+		t.Fatal("LogStreamChunks = true, want false because stream chunk logging is disabled in lightweight diagnostics")
 	}
 	if settings.MaxBodyBytes != 123 {
 		t.Fatalf("MaxBodyBytes = %d, want 123", settings.MaxBodyBytes)

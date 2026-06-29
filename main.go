@@ -63,9 +63,9 @@ const abiVersion uint32 = 1
 
 const (
 	pluginID            = "openai-tool-order-repair"
-	pluginVersion       = "0.1.3"
+	pluginVersion       = "0.1.4"
 	defaultDebugLogPath = "logs/openai-tool-order-repair-debug.jsonl"
-	defaultMaxBodyBytes = 256 * 1024
+	defaultMaxBodyBytes = 4096
 	debugPanelTailBytes = 512 * 1024
 )
 
@@ -78,8 +78,8 @@ const (
 var debugMu sync.Mutex
 var debugConfig = debugSettings{
 	LogPath:         defaultDebugLogPath,
-	IncludeBody:     true,
-	LogStreamChunks: true,
+	IncludeBody:     false,
+	LogStreamChunks: false,
 	MaxBodyBytes:    defaultMaxBodyBytes,
 }
 
@@ -192,6 +192,7 @@ type debugRecord struct {
 	Changed           bool                `json:"changed,omitempty"`
 	BodyBytes         int                 `json:"body_bytes,omitempty"`
 	RepairedBodyBytes int                 `json:"repaired_body_bytes,omitempty"`
+	RepairSummary     *repairSummary      `json:"repair_summary,omitempty"`
 	RequestHeaders    map[string][]string `json:"request_headers,omitempty"`
 	ResponseHeaders   map[string][]string `json:"response_headers,omitempty"`
 	Body              any                 `json:"body,omitempty"`
@@ -200,6 +201,21 @@ type debugRecord struct {
 	RequestBody       any                 `json:"request_body,omitempty"`
 	Error             string              `json:"error,omitempty"`
 	Metadata          map[string]any      `json:"metadata,omitempty"`
+}
+
+type repairSummary struct {
+	Messages *repairCollectionSummary `json:"messages,omitempty"`
+	Input    *repairCollectionSummary `json:"input,omitempty"`
+}
+
+type repairCollectionSummary struct {
+	ItemCount                  int      `json:"item_count,omitempty"`
+	AssistantToolCallCount     int      `json:"assistant_tool_call_count,omitempty"`
+	ToolResultCount            int      `json:"tool_result_count,omitempty"`
+	MatchedToolResultCount     int      `json:"matched_tool_result_count,omitempty"`
+	ReorderedToolResultCount   int      `json:"reordered_tool_result_count,omitempty"`
+	ReorderedToolResultCallIDs []string `json:"reordered_tool_result_call_ids,omitempty"`
+	Changed                    bool     `json:"changed,omitempty"`
 }
 
 type messageMeta struct {
@@ -289,7 +305,7 @@ func handleMethod(method string, rawRequest []byte) ([]byte, error) {
 }
 
 func pluginRegistration() ([]byte, error) {
-	return okEnvelopeJSON(`{"schema_version":1,"metadata":{"Name":"openai-tool-order-repair","Version":"` + pluginVersion + `","Author":"MEIZU16","GitHubRepository":"https://github.com/MEIZU16/cpa-plugin-openai-tool-order-repair","Logo":"","ConfigFields":[{"Name":"debug","Type":"boolean","Description":"Write detailed request and response debug records."},{"Name":"debug_log_path","Type":"string","Description":"Path for JSONL debug records. Relative paths are resolved from the CLIProxyAPI working directory."},{"Name":"debug_include_body","Type":"boolean","Description":"Include request and response bodies in debug records. Sensitive data may be logged."},{"Name":"debug_log_stream_chunks","Type":"boolean","Description":"Log streaming response chunks when debug is enabled."},{"Name":"debug_max_body_bytes","Type":"integer","Description":"Maximum bytes stored for each logged body field."}]},"capabilities":{"request_interceptor":true,"response_interceptor":true,"response_stream_interceptor":true,"management_api":true}}`)
+	return okEnvelopeJSON(`{"schema_version":1,"metadata":{"Name":"openai-tool-order-repair","Version":"` + pluginVersion + `","Author":"MEIZU16","GitHubRepository":"https://github.com/MEIZU16/cpa-plugin-openai-tool-order-repair","Logo":"","ConfigFields":[{"Name":"debug","Type":"boolean","Description":"Write lightweight JSONL diagnostics for tool-order repair decisions."},{"Name":"debug_log_path","Type":"string","Description":"Path for JSONL debug records. Relative paths are resolved from the CLIProxyAPI working directory."},{"Name":"debug_include_body","Type":"boolean","Description":"Optionally include truncated request and response bodies. Disabled by default; sensitive data may be logged."},{"Name":"debug_max_body_bytes","Type":"integer","Description":"Maximum bytes stored when body logging is explicitly enabled. Default is 4096."}]},"capabilities":{"request_interceptor":true,"response_interceptor":true,"management_api":true}}`)
 }
 
 func registerManagementPanel() ([]byte, error) {
@@ -326,8 +342,8 @@ func handleManagementRequest(rawRequest []byte) ([]byte, error) {
 func applyDebugConfig(rawRequest []byte) {
 	settings := debugSettings{
 		LogPath:         defaultDebugLogPath,
-		IncludeBody:     true,
-		LogStreamChunks: true,
+		IncludeBody:     false,
+		LogStreamChunks: false,
 		MaxBodyBytes:    defaultMaxBodyBytes,
 	}
 
@@ -348,8 +364,8 @@ func applyDebugConfig(rawRequest []byte) {
 
 	settings.Enabled = boolConfig(config, "debug", false)
 	settings.LogPath = stringConfig(config, "debug_log_path", defaultDebugLogPath)
-	settings.IncludeBody = boolConfig(config, "debug_include_body", true)
-	settings.LogStreamChunks = boolConfig(config, "debug_log_stream_chunks", true)
+	settings.IncludeBody = boolConfig(config, "debug_include_body", false)
+	settings.LogStreamChunks = false
 	settings.MaxBodyBytes = intConfig(config, "debug_max_body_bytes", defaultMaxBodyBytes)
 	if settings.MaxBodyBytes <= 0 {
 		settings.MaxBodyBytes = defaultMaxBodyBytes
@@ -386,7 +402,6 @@ func interceptOpenAIRequest(event string, rawRequest []byte) ([]byte, error) {
 			Model:          req.Model,
 			RequestedModel: req.RequestedModel,
 			Stream:         req.Stream,
-			RequestHeaders: req.Headers,
 			Error:          "decode request body: " + errDecode.Error(),
 			Metadata:       req.Metadata,
 		})
@@ -401,14 +416,13 @@ func interceptOpenAIRequest(event string, rawRequest []byte) ([]byte, error) {
 			RequestedModel: req.RequestedModel,
 			Stream:         req.Stream,
 			BodyBytes:      len(body),
-			RequestHeaders: req.Headers,
-			Body:           debugBodyValue(body),
 			Error:          "empty or invalid JSON request body",
 			Metadata:       req.Metadata,
 		})
 		return okEnvelopeValue(interceptResponse{})
 	}
 
+	repairInfo := summarizeOpenAIToolOrder(body)
 	repaired, changed, errRepair := repairOpenAIToolMessageOrder(body)
 	if errRepair != nil {
 		appendDebugRecord(debugRecord{
@@ -419,8 +433,7 @@ func interceptOpenAIRequest(event string, rawRequest []byte) ([]byte, error) {
 			RequestedModel: req.RequestedModel,
 			Stream:         req.Stream,
 			BodyBytes:      len(body),
-			RequestHeaders: req.Headers,
-			Body:           debugBodyValue(body),
+			RepairSummary:  repairInfo,
 			Error:          "repair request body: " + errRepair.Error(),
 			Metadata:       req.Metadata,
 		})
@@ -437,9 +450,8 @@ func interceptOpenAIRequest(event string, rawRequest []byte) ([]byte, error) {
 		Changed:           changed,
 		BodyBytes:         len(body),
 		RepairedBodyBytes: len(repaired),
-		RequestHeaders:    req.Headers,
+		RepairSummary:     repairInfo,
 		Body:              debugBodyValue(body),
-		RepairedBody:      debugBodyValue(repaired),
 		Metadata:          req.Metadata,
 	})
 
@@ -457,22 +469,16 @@ func interceptOpenAIResponse(rawRequest []byte) ([]byte, error) {
 	}
 
 	body, bodyErr := decodeBody(req.Body)
-	originalRequest, _ := decodeBody(req.OriginalRequest)
-	requestBody, _ := decodeBody(req.RequestBody)
 	record := debugRecord{
-		Event:           "response.intercept_after",
-		SourceFormat:    req.SourceFormat,
-		Model:           req.Model,
-		RequestedModel:  req.RequestedModel,
-		Stream:          req.Stream,
-		StatusCode:      req.StatusCode,
-		BodyBytes:       len(body),
-		RequestHeaders:  req.RequestHeaders,
-		ResponseHeaders: req.ResponseHeaders,
-		Body:            debugBodyValue(body),
-		OriginalRequest: debugBodyValue(originalRequest),
-		RequestBody:     debugBodyValue(requestBody),
-		Metadata:        req.Metadata,
+		Event:          "response.intercept_after",
+		SourceFormat:   req.SourceFormat,
+		Model:          req.Model,
+		RequestedModel: req.RequestedModel,
+		Stream:         req.Stream,
+		StatusCode:     req.StatusCode,
+		BodyBytes:      len(body),
+		Body:           debugBodyValue(body),
+		Metadata:       req.Metadata,
 	}
 	if bodyErr != nil {
 		record.Error = "decode response body: " + bodyErr.Error()
@@ -487,33 +493,6 @@ func interceptOpenAIStreamChunk(rawRequest []byte) ([]byte, error) {
 		return nil, fmt.Errorf("decode stream chunk intercept request: %w", err)
 	}
 
-	settings := currentDebugSettings()
-	if settings.Enabled && !settings.LogStreamChunks && req.ChunkIndex >= 0 {
-		return okEnvelopeValue(streamChunkInterceptResponse{})
-	}
-
-	body, bodyErr := decodeBody(req.Body)
-	originalRequest, _ := decodeBody(req.OriginalRequest)
-	requestBody, _ := decodeBody(req.RequestBody)
-	record := debugRecord{
-		Event:             "response.intercept_stream_chunk",
-		SourceFormat:      req.SourceFormat,
-		Model:             req.Model,
-		RequestedModel:    req.RequestedModel,
-		ChunkIndex:        req.ChunkIndex,
-		HistoryChunkCount: len(req.HistoryChunks),
-		BodyBytes:         len(body),
-		RequestHeaders:    req.RequestHeaders,
-		ResponseHeaders:   req.ResponseHeaders,
-		Body:              debugBodyValue(body),
-		OriginalRequest:   debugBodyValue(originalRequest),
-		RequestBody:       debugBodyValue(requestBody),
-		Metadata:          req.Metadata,
-	}
-	if bodyErr != nil {
-		record.Error = "decode stream chunk body: " + bodyErr.Error()
-	}
-	appendDebugRecord(record)
 	return okEnvelopeValue(streamChunkInterceptResponse{})
 }
 
@@ -532,6 +511,71 @@ func decodeBody(raw json.RawMessage) ([]byte, error) {
 		return nil, err
 	}
 	return []byte(bodyString), nil
+}
+
+func summarizeOpenAIToolOrder(body []byte) *repairSummary {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(body, &root); err != nil {
+		return nil
+	}
+
+	var summary repairSummary
+	if rawMessages, ok := root["messages"]; ok {
+		summary.Messages = summarizeRepairCollection(rawMessages)
+	}
+	if rawInput, ok := root["input"]; ok {
+		summary.Input = summarizeRepairCollection(rawInput)
+	}
+	if summary.Messages == nil && summary.Input == nil {
+		return nil
+	}
+	return &summary
+}
+
+func summarizeRepairCollection(rawItems json.RawMessage) *repairCollectionSummary {
+	var items []json.RawMessage
+	if err := json.Unmarshal(rawItems, &items); err != nil {
+		return nil
+	}
+
+	metas := make([]messageMeta, len(items))
+	assistantIndexesByID := make(map[string][]int)
+	toolResultIndexesByID := make(map[string][]int)
+	for i, raw := range items {
+		_ = json.Unmarshal(raw, &metas[i])
+		for _, toolCallID := range getAssistantToolCallIDs(metas[i]) {
+			if toolCallID == "" {
+				continue
+			}
+			assistantIndexesByID[toolCallID] = append(assistantIndexesByID[toolCallID], i)
+		}
+		if toolResultID := getToolResultID(metas[i]); toolResultID != "" {
+			toolResultIndexesByID[toolResultID] = append(toolResultIndexesByID[toolResultID], i)
+		}
+	}
+
+	summary := &repairCollectionSummary{ItemCount: len(items)}
+	for _, indexes := range assistantIndexesByID {
+		summary.AssistantToolCallCount += len(indexes)
+	}
+	for toolResultID, resultIndexes := range toolResultIndexesByID {
+		summary.ToolResultCount += len(resultIndexes)
+		assistantIndexes := assistantIndexesByID[toolResultID]
+		if len(assistantIndexes) == 0 {
+			continue
+		}
+		summary.MatchedToolResultCount += len(resultIndexes)
+		firstAssistantIndex := assistantIndexes[0]
+		for _, resultIndex := range resultIndexes {
+			if resultIndex < firstAssistantIndex {
+				summary.ReorderedToolResultCount++
+				summary.ReorderedToolResultCallIDs = append(summary.ReorderedToolResultCallIDs, toolResultID)
+			}
+		}
+	}
+	_, changed, _ := reorderOpenAIItems(rawItems)
+	summary.Changed = changed
+	return summary
 }
 
 func repairOpenAIToolMessageOrder(body []byte) ([]byte, bool, error) {

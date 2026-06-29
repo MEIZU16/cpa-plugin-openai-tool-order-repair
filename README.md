@@ -55,8 +55,9 @@ store UI.
 
 ## Debug logging
 
-Version `0.1.1` adds optional JSONL debug logging for request interception,
-non-streaming responses, and streaming response chunks.
+Version `0.1.4` writes lightweight JSONL diagnostics for the tool-order repair
+decision. By default, debug records do not include request bodies, response
+bodies, headers, or streaming chunks.
 
 Example configuration:
 
@@ -68,10 +69,14 @@ plugins:
       priority: 1
       debug: true
       debug_log_path: "logs/openai-tool-order-repair-debug.jsonl"
-      debug_include_body: true
-      debug_log_stream_chunks: true
-      debug_max_body_bytes: 262144
+      debug_include_body: false
+      debug_log_stream_chunks: false
+      debug_max_body_bytes: 4096
 ```
+
+The useful default records include request size, whether a repair was applied,
+message/input item counts, assistant tool-call counts, tool-result counts, and
+the call IDs of tool results that were moved.
 
 The default log path is relative to the CLIProxyAPI working directory. In the
 official Docker image that usually means:
@@ -87,8 +92,8 @@ host at:
 ./logs/openai-tool-order-repair-debug.jsonl
 ```
 
-Warning: `debug_include_body: true` may record prompts, responses, headers, and
-tool payloads. Disable it or reduce `debug_max_body_bytes` when sharing logs.
+Warning: `debug_include_body: true` may record prompts, responses, and tool
+payloads. Keep it disabled unless you are investigating a specific payload.
 
 ## Management debug panel
 
@@ -102,6 +107,9 @@ last 512 KiB of the log file to avoid loading very large logs into the browser.
 
 Version `0.1.3` fixes reading debug settings from the `config_yaml` lifecycle
 payload sent by CLIProxyAPI, so the panel reflects the saved `debug` switch.
+
+Version `0.1.4` makes diagnostics lightweight by default and avoids repeating
+request bodies on stream chunks.
 
 ## Build locally
 
@@ -119,7 +127,7 @@ openai-tool-order-repair_<version>_<goos>_<goarch>.zip
 checksums.txt
 ```
 
-For Linux amd64 version `0.1.3`, the zip must contain this file at the zip root:
+For Linux amd64 version `0.1.4`, the zip must contain this file at the zip root:
 
 ```text
 openai-tool-order-repair.so
@@ -128,5 +136,5 @@ openai-tool-order-repair.so
 Create release assets with:
 
 ```bash
-./scripts/package_release.sh 0.1.3 linux amd64
+./scripts/package_release.sh 0.1.4 linux amd64
 ```
