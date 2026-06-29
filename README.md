@@ -55,9 +55,10 @@ store UI.
 
 ## Debug logging
 
-Version `0.1.4` writes lightweight JSONL diagnostics for the tool-order repair
-decision. By default, debug records do not include request bodies, response
-bodies, headers, or streaming chunks.
+Version `0.1.5` writes analysis-quality but lightweight JSONL diagnostics for
+tool-order repair decisions and response-stream health. By default, debug
+records do not include request bodies, response bodies, headers, or full
+streaming chunks.
 
 Example configuration:
 
@@ -70,13 +71,22 @@ plugins:
       debug: true
       debug_log_path: "logs/openai-tool-order-repair-debug.jsonl"
       debug_include_body: false
+      debug_stream_diagnostics: true
       debug_log_stream_chunks: false
       debug_max_body_bytes: 4096
 ```
 
-The useful default records include request size, whether a repair was applied,
-message/input item counts, assistant tool-call counts, tool-result counts, and
-the call IDs of tool results that were moved.
+The useful default records include stable request/repaired fingerprints, request
+size, whether a repair was applied, message/input item counts, assistant
+tool-call counts, tool-result counts, and repair actions with call ID, source
+index, destination index, and reason.
+
+When `debug_stream_diagnostics` is enabled, response stream records are compact
+summaries only. They include chunk counters, known byte counts, event type
+counts, terminal/error state, finish reason, and detectable output/tool-call
+counters. To avoid log explosion, the plugin logs the first stream chunk, every
+25th chunk, and terminal/error chunks. The legacy `debug_log_stream_chunks`
+setting is intentionally ignored for full stream body logging.
 
 The default log path is relative to the CLIProxyAPI working directory. In the
 official Docker image that usually means:
@@ -111,6 +121,10 @@ payload sent by CLIProxyAPI, so the panel reflects the saved `debug` switch.
 Version `0.1.4` makes diagnostics lightweight by default and avoids repeating
 request bodies on stream chunks.
 
+Version `0.1.5` adds compact response-stream diagnostics and stable
+fingerprints so request repair records and response/stream summaries can be
+correlated without logging body content.
+
 ## Build locally
 
 ```bash
@@ -127,7 +141,7 @@ openai-tool-order-repair_<version>_<goos>_<goarch>.zip
 checksums.txt
 ```
 
-For Linux amd64 version `0.1.4`, the zip must contain this file at the zip root:
+For Linux amd64 version `0.1.5`, the zip must contain this file at the zip root:
 
 ```text
 openai-tool-order-repair.so
@@ -136,5 +150,5 @@ openai-tool-order-repair.so
 Create release assets with:
 
 ```bash
-./scripts/package_release.sh 0.1.4 linux amd64
+./scripts/package_release.sh 0.1.5 linux amd64
 ```

@@ -44,6 +44,8 @@ import "C"
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -63,10 +65,11 @@ const abiVersion uint32 = 1
 
 const (
 	pluginID            = "openai-tool-order-repair"
-	pluginVersion       = "0.1.4"
+	pluginVersion       = "0.1.5"
 	defaultDebugLogPath = "logs/openai-tool-order-repair-debug.jsonl"
 	defaultMaxBodyBytes = 4096
 	debugPanelTailBytes = 512 * 1024
+	streamProgressEvery = 25
 )
 
 const (
@@ -77,18 +80,20 @@ const (
 
 var debugMu sync.Mutex
 var debugConfig = debugSettings{
-	LogPath:         defaultDebugLogPath,
-	IncludeBody:     false,
-	LogStreamChunks: false,
-	MaxBodyBytes:    defaultMaxBodyBytes,
+	LogPath:           defaultDebugLogPath,
+	IncludeBody:       false,
+	LogStreamChunks:   false,
+	StreamDiagnostics: true,
+	MaxBodyBytes:      defaultMaxBodyBytes,
 }
 
 type debugSettings struct {
-	Enabled         bool
-	LogPath         string
-	IncludeBody     bool
-	LogStreamChunks bool
-	MaxBodyBytes    int
+	Enabled           bool
+	LogPath           string
+	IncludeBody       bool
+	LogStreamChunks   bool
+	StreamDiagnostics bool
+	MaxBodyBytes      int
 }
 
 type pluginConfigRequest struct {
@@ -179,28 +184,31 @@ type managementResponse struct {
 }
 
 type debugRecord struct {
-	Time              string              `json:"time"`
-	Event             string              `json:"event"`
-	SourceFormat      string              `json:"source_format,omitempty"`
-	ToFormat          string              `json:"to_format,omitempty"`
-	Model             string              `json:"model,omitempty"`
-	RequestedModel    string              `json:"requested_model,omitempty"`
-	Stream            bool                `json:"stream,omitempty"`
-	StatusCode        int                 `json:"status_code,omitempty"`
-	ChunkIndex        int                 `json:"chunk_index,omitempty"`
-	HistoryChunkCount int                 `json:"history_chunk_count,omitempty"`
-	Changed           bool                `json:"changed,omitempty"`
-	BodyBytes         int                 `json:"body_bytes,omitempty"`
-	RepairedBodyBytes int                 `json:"repaired_body_bytes,omitempty"`
-	RepairSummary     *repairSummary      `json:"repair_summary,omitempty"`
-	RequestHeaders    map[string][]string `json:"request_headers,omitempty"`
-	ResponseHeaders   map[string][]string `json:"response_headers,omitempty"`
-	Body              any                 `json:"body,omitempty"`
-	RepairedBody      any                 `json:"repaired_body,omitempty"`
-	OriginalRequest   any                 `json:"original_request,omitempty"`
-	RequestBody       any                 `json:"request_body,omitempty"`
-	Error             string              `json:"error,omitempty"`
-	Metadata          map[string]any      `json:"metadata,omitempty"`
+	Time                string              `json:"time"`
+	Event               string              `json:"event"`
+	RequestFingerprint  string              `json:"request_fingerprint,omitempty"`
+	RepairedFingerprint string              `json:"repaired_fingerprint,omitempty"`
+	SourceFormat        string              `json:"source_format,omitempty"`
+	ToFormat            string              `json:"to_format,omitempty"`
+	Model               string              `json:"model,omitempty"`
+	RequestedModel      string              `json:"requested_model,omitempty"`
+	Stream              bool                `json:"stream,omitempty"`
+	StatusCode          int                 `json:"status_code,omitempty"`
+	ChunkIndex          int                 `json:"chunk_index,omitempty"`
+	HistoryChunkCount   int                 `json:"history_chunk_count,omitempty"`
+	Changed             bool                `json:"changed,omitempty"`
+	BodyBytes           int                 `json:"body_bytes,omitempty"`
+	RepairedBodyBytes   int                 `json:"repaired_body_bytes,omitempty"`
+	RepairSummary       *repairSummary      `json:"repair_summary,omitempty"`
+	StreamSummary       *streamSummary      `json:"stream_summary,omitempty"`
+	RequestHeaders      map[string][]string `json:"request_headers,omitempty"`
+	ResponseHeaders     map[string][]string `json:"response_headers,omitempty"`
+	Body                any                 `json:"body,omitempty"`
+	RepairedBody        any                 `json:"repaired_body,omitempty"`
+	OriginalRequest     any                 `json:"original_request,omitempty"`
+	RequestBody         any                 `json:"request_body,omitempty"`
+	Error               string              `json:"error,omitempty"`
+	Metadata            map[string]any      `json:"metadata,omitempty"`
 }
 
 type repairSummary struct {
@@ -209,13 +217,42 @@ type repairSummary struct {
 }
 
 type repairCollectionSummary struct {
-	ItemCount                  int      `json:"item_count,omitempty"`
-	AssistantToolCallCount     int      `json:"assistant_tool_call_count,omitempty"`
-	ToolResultCount            int      `json:"tool_result_count,omitempty"`
-	MatchedToolResultCount     int      `json:"matched_tool_result_count,omitempty"`
-	ReorderedToolResultCount   int      `json:"reordered_tool_result_count,omitempty"`
-	ReorderedToolResultCallIDs []string `json:"reordered_tool_result_call_ids,omitempty"`
-	Changed                    bool     `json:"changed,omitempty"`
+	ItemCount                  int            `json:"item_count,omitempty"`
+	AssistantToolCallCount     int            `json:"assistant_tool_call_count,omitempty"`
+	ToolResultCount            int            `json:"tool_result_count,omitempty"`
+	MatchedToolResultCount     int            `json:"matched_tool_result_count,omitempty"`
+	ReorderedToolResultCount   int            `json:"reordered_tool_result_count,omitempty"`
+	ReorderedToolResultCallIDs []string       `json:"reordered_tool_result_call_ids,omitempty"`
+	Actions                    []repairAction `json:"actions,omitempty"`
+	Changed                    bool           `json:"changed,omitempty"`
+}
+
+type repairAction struct {
+	CallID    string `json:"call_id"`
+	FromIndex int    `json:"from_index"`
+	ToIndex   int    `json:"to_index"`
+	Reason    string `json:"reason"`
+}
+
+type streamSummary struct {
+	ChunkCount          int            `json:"chunk_count,omitempty"`
+	HistoryChunkCount   int            `json:"history_chunk_count,omitempty"`
+	ChunkIndex          int            `json:"chunk_index,omitempty"`
+	CurrentChunkBytes   int            `json:"current_chunk_bytes,omitempty"`
+	TotalKnownBytes     int            `json:"total_known_bytes,omitempty"`
+	EventTypes          map[string]int `json:"event_types,omitempty"`
+	CurrentEventType    string         `json:"current_event_type,omitempty"`
+	TerminalEvent       string         `json:"terminal_event,omitempty"`
+	FinishReason        string         `json:"finish_reason,omitempty"`
+	HasError            bool           `json:"has_error,omitempty"`
+	ErrorType           string         `json:"error_type,omitempty"`
+	OutputItemCount     int            `json:"output_item_count,omitempty"`
+	FunctionCallCount   int            `json:"function_call_count,omitempty"`
+	ToolCallDeltaCount  int            `json:"tool_call_delta_count,omitempty"`
+	FunctionOutputCount int            `json:"function_output_count,omitempty"`
+	ResponseCompleted   bool           `json:"response_completed,omitempty"`
+	ResponseFailed      bool           `json:"response_failed,omitempty"`
+	ResponseIncomplete  bool           `json:"response_incomplete,omitempty"`
 }
 
 type messageMeta struct {
@@ -305,7 +342,7 @@ func handleMethod(method string, rawRequest []byte) ([]byte, error) {
 }
 
 func pluginRegistration() ([]byte, error) {
-	return okEnvelopeJSON(`{"schema_version":1,"metadata":{"Name":"openai-tool-order-repair","Version":"` + pluginVersion + `","Author":"MEIZU16","GitHubRepository":"https://github.com/MEIZU16/cpa-plugin-openai-tool-order-repair","Logo":"","ConfigFields":[{"Name":"debug","Type":"boolean","Description":"Write lightweight JSONL diagnostics for tool-order repair decisions."},{"Name":"debug_log_path","Type":"string","Description":"Path for JSONL debug records. Relative paths are resolved from the CLIProxyAPI working directory."},{"Name":"debug_include_body","Type":"boolean","Description":"Optionally include truncated request and response bodies. Disabled by default; sensitive data may be logged."},{"Name":"debug_max_body_bytes","Type":"integer","Description":"Maximum bytes stored when body logging is explicitly enabled. Default is 4096."}]},"capabilities":{"request_interceptor":true,"response_interceptor":true,"management_api":true}}`)
+	return okEnvelopeJSON(`{"schema_version":1,"metadata":{"Name":"openai-tool-order-repair","Version":"` + pluginVersion + `","Author":"MEIZU16","GitHubRepository":"https://github.com/MEIZU16/cpa-plugin-openai-tool-order-repair","Logo":"","ConfigFields":[{"Name":"debug","Type":"boolean","Description":"Write lightweight JSONL diagnostics for repair decisions and response-stream health."},{"Name":"debug_log_path","Type":"string","Description":"Path for JSONL debug records. Relative paths are resolved from the CLIProxyAPI working directory."},{"Name":"debug_include_body","Type":"boolean","Description":"Optionally include truncated request and response bodies. Disabled by default; sensitive data may be logged."},{"Name":"debug_stream_diagnostics","Type":"boolean","Description":"Record compact response stream summaries without chunk bodies. Enabled by default when debug is enabled."},{"Name":"debug_max_body_bytes","Type":"integer","Description":"Maximum bytes stored when body logging is explicitly enabled. Default is 4096."}]},"capabilities":{"request_interceptor":true,"response_interceptor":true,"response_stream_interceptor":true,"management_api":true}}`)
 }
 
 func registerManagementPanel() ([]byte, error) {
@@ -341,10 +378,11 @@ func handleManagementRequest(rawRequest []byte) ([]byte, error) {
 
 func applyDebugConfig(rawRequest []byte) {
 	settings := debugSettings{
-		LogPath:         defaultDebugLogPath,
-		IncludeBody:     false,
-		LogStreamChunks: false,
-		MaxBodyBytes:    defaultMaxBodyBytes,
+		LogPath:           defaultDebugLogPath,
+		IncludeBody:       false,
+		LogStreamChunks:   false,
+		StreamDiagnostics: true,
+		MaxBodyBytes:      defaultMaxBodyBytes,
 	}
 
 	var req pluginConfigRequest
@@ -366,6 +404,7 @@ func applyDebugConfig(rawRequest []byte) {
 	settings.LogPath = stringConfig(config, "debug_log_path", defaultDebugLogPath)
 	settings.IncludeBody = boolConfig(config, "debug_include_body", false)
 	settings.LogStreamChunks = false
+	settings.StreamDiagnostics = boolConfig(config, "debug_stream_diagnostics", true)
 	settings.MaxBodyBytes = intConfig(config, "debug_max_body_bytes", defaultMaxBodyBytes)
 	if settings.MaxBodyBytes <= 0 {
 		settings.MaxBodyBytes = defaultMaxBodyBytes
@@ -441,18 +480,20 @@ func interceptOpenAIRequest(event string, rawRequest []byte) ([]byte, error) {
 	}
 
 	appendDebugRecord(debugRecord{
-		Event:             event,
-		SourceFormat:      req.SourceFormat,
-		ToFormat:          req.ToFormat,
-		Model:             req.Model,
-		RequestedModel:    req.RequestedModel,
-		Stream:            req.Stream,
-		Changed:           changed,
-		BodyBytes:         len(body),
-		RepairedBodyBytes: len(repaired),
-		RepairSummary:     repairInfo,
-		Body:              debugBodyValue(body),
-		Metadata:          req.Metadata,
+		Event:               event,
+		RequestFingerprint:  fingerprintBytes(body),
+		RepairedFingerprint: fingerprintBytes(repaired),
+		SourceFormat:        req.SourceFormat,
+		ToFormat:            req.ToFormat,
+		Model:               req.Model,
+		RequestedModel:      req.RequestedModel,
+		Stream:              req.Stream,
+		Changed:             changed,
+		BodyBytes:           len(body),
+		RepairedBodyBytes:   len(repaired),
+		RepairSummary:       repairInfo,
+		Body:                debugBodyValue(body),
+		Metadata:            req.Metadata,
 	})
 
 	if !changed {
@@ -470,15 +511,16 @@ func interceptOpenAIResponse(rawRequest []byte) ([]byte, error) {
 
 	body, bodyErr := decodeBody(req.Body)
 	record := debugRecord{
-		Event:          "response.intercept_after",
-		SourceFormat:   req.SourceFormat,
-		Model:          req.Model,
-		RequestedModel: req.RequestedModel,
-		Stream:         req.Stream,
-		StatusCode:     req.StatusCode,
-		BodyBytes:      len(body),
-		Body:           debugBodyValue(body),
-		Metadata:       req.Metadata,
+		Event:              "response.intercept_after",
+		RequestFingerprint: fingerprintRawMessage(req.RequestBody),
+		SourceFormat:       req.SourceFormat,
+		Model:              req.Model,
+		RequestedModel:     req.RequestedModel,
+		Stream:             req.Stream,
+		StatusCode:         req.StatusCode,
+		BodyBytes:          len(body),
+		Body:               debugBodyValue(body),
+		Metadata:           req.Metadata,
 	}
 	if bodyErr != nil {
 		record.Error = "decode response body: " + bodyErr.Error()
@@ -491,6 +533,30 @@ func interceptOpenAIStreamChunk(rawRequest []byte) ([]byte, error) {
 	var req streamChunkInterceptRequest
 	if err := json.Unmarshal(rawRequest, &req); err != nil {
 		return nil, fmt.Errorf("decode stream chunk intercept request: %w", err)
+	}
+
+	settings := currentDebugSettings()
+	if settings.Enabled && settings.StreamDiagnostics {
+		body, bodyErr := decodeBody(req.Body)
+		summary := summarizeStreamChunks(req.HistoryChunks, body, req.ChunkIndex)
+		record := debugRecord{
+			Event:              "response.intercept_stream_chunk",
+			RequestFingerprint: fingerprintRawMessage(req.RequestBody),
+			SourceFormat:       req.SourceFormat,
+			Model:              req.Model,
+			RequestedModel:     req.RequestedModel,
+			ChunkIndex:         req.ChunkIndex,
+			HistoryChunkCount:  len(req.HistoryChunks),
+			BodyBytes:          len(body),
+			StreamSummary:      summary,
+			Metadata:           req.Metadata,
+		}
+		if bodyErr != nil {
+			record.Error = "decode stream chunk body: " + bodyErr.Error()
+		}
+		if shouldLogStreamSummary(summary) || bodyErr != nil {
+			appendDebugRecord(record)
+		}
 	}
 
 	return okEnvelopeValue(streamChunkInterceptResponse{})
@@ -541,6 +607,7 @@ func summarizeRepairCollection(rawItems json.RawMessage) *repairCollectionSummar
 	metas := make([]messageMeta, len(items))
 	assistantIndexesByID := make(map[string][]int)
 	toolResultIndexesByID := make(map[string][]int)
+	assistantToolCallCount := 0
 	for i, raw := range items {
 		_ = json.Unmarshal(raw, &metas[i])
 		for _, toolCallID := range getAssistantToolCallIDs(metas[i]) {
@@ -548,15 +615,25 @@ func summarizeRepairCollection(rawItems json.RawMessage) *repairCollectionSummar
 				continue
 			}
 			assistantIndexesByID[toolCallID] = append(assistantIndexesByID[toolCallID], i)
+			assistantToolCallCount++
 		}
 		if toolResultID := getToolResultID(metas[i]); toolResultID != "" {
 			toolResultIndexesByID[toolResultID] = append(toolResultIndexesByID[toolResultID], i)
 		}
 	}
 
-	summary := &repairCollectionSummary{ItemCount: len(items)}
-	for _, indexes := range assistantIndexesByID {
-		summary.AssistantToolCallCount += len(indexes)
+	_, reorderedOriginalIndexes, changed := reorderMessagesWithIndexes(items)
+	reorderedIndexByOriginal := make(map[int]int, len(items))
+	if changed {
+		for newIndex, originalIndex := range reorderedOriginalIndexes {
+			reorderedIndexByOriginal[originalIndex] = newIndex
+		}
+	}
+
+	summary := &repairCollectionSummary{
+		ItemCount:              len(items),
+		AssistantToolCallCount: assistantToolCallCount,
+		Changed:                changed,
 	}
 	for toolResultID, resultIndexes := range toolResultIndexesByID {
 		summary.ToolResultCount += len(resultIndexes)
@@ -567,14 +644,23 @@ func summarizeRepairCollection(rawItems json.RawMessage) *repairCollectionSummar
 		summary.MatchedToolResultCount += len(resultIndexes)
 		firstAssistantIndex := assistantIndexes[0]
 		for _, resultIndex := range resultIndexes {
-			if resultIndex < firstAssistantIndex {
+			newIndex, moved := reorderedIndexByOriginal[resultIndex]
+			if changed && moved && newIndex != resultIndex {
 				summary.ReorderedToolResultCount++
 				summary.ReorderedToolResultCallIDs = append(summary.ReorderedToolResultCallIDs, toolResultID)
+				reason := "tool_result_not_immediately_after_function_call"
+				if resultIndex < firstAssistantIndex {
+					reason = "tool_result_before_function_call"
+				}
+				summary.Actions = append(summary.Actions, repairAction{
+					CallID:    toolResultID,
+					FromIndex: resultIndex,
+					ToIndex:   newIndex,
+					Reason:    reason,
+				})
 			}
 		}
 	}
-	_, changed, _ := reorderOpenAIItems(rawItems)
-	summary.Changed = changed
 	return summary
 }
 
@@ -637,6 +723,11 @@ func reorderOpenAIItems(rawItems json.RawMessage) (json.RawMessage, bool, error)
 }
 
 func reorderMessages(messages []json.RawMessage) ([]json.RawMessage, bool) {
+	reordered, _, changed := reorderMessagesWithIndexes(messages)
+	return reordered, changed
+}
+
+func reorderMessagesWithIndexes(messages []json.RawMessage) ([]json.RawMessage, []int, bool) {
 	metas := make([]messageMeta, len(messages))
 	toolResultIndexesByID := make(map[string][]int)
 	assistantToolIDs := make(map[string]struct{})
@@ -654,11 +745,12 @@ func reorderMessages(messages []json.RawMessage) ([]json.RawMessage, bool) {
 	}
 
 	if len(toolResultIndexesByID) == 0 || len(assistantToolIDs) == 0 {
-		return messages, false
+		return messages, sequentialIndexes(len(messages)), false
 	}
 
 	inserted := make([]bool, len(messages))
 	reordered := make([]json.RawMessage, 0, len(messages))
+	originalIndexes := make([]int, 0, len(messages))
 	for i, raw := range messages {
 		meta := metas[i]
 		if toolResultID := getToolResultID(meta); toolResultID != "" {
@@ -668,6 +760,7 @@ func reorderMessages(messages []json.RawMessage) ([]json.RawMessage, bool) {
 		}
 
 		reordered = append(reordered, raw)
+		originalIndexes = append(originalIndexes, i)
 		toolCallIDs := getAssistantToolCallIDs(meta)
 		if len(toolCallIDs) == 0 {
 			continue
@@ -682,15 +775,24 @@ func reorderMessages(messages []json.RawMessage) ([]json.RawMessage, bool) {
 					continue
 				}
 				reordered = append(reordered, messages[resultIndex])
+				originalIndexes = append(originalIndexes, resultIndex)
 				inserted[resultIndex] = true
 			}
 		}
 	}
 
 	if len(reordered) != len(messages) {
-		return messages, false
+		return messages, sequentialIndexes(len(messages)), false
 	}
-	return reordered, !sameMessageOrder(messages, reordered)
+	return reordered, originalIndexes, !sameMessageOrder(messages, reordered)
+}
+
+func sequentialIndexes(count int) []int {
+	indexes := make([]int, count)
+	for i := range indexes {
+		indexes[i] = i
+	}
+	return indexes
 }
 
 func sameMessageOrder(a, b []json.RawMessage) bool {
@@ -867,6 +969,272 @@ func debugBodyValue(body []byte) any {
 	return string(body)
 }
 
+func fingerprintBytes(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:8])
+}
+
+func fingerprintRawMessage(raw json.RawMessage) string {
+	body, errDecode := decodeBody(raw)
+	if errDecode != nil {
+		return ""
+	}
+	return fingerprintBytes(body)
+}
+
+func shouldLogStreamSummary(summary *streamSummary) bool {
+	if summary == nil {
+		return false
+	}
+	if summary.ResponseCompleted || summary.ResponseFailed || summary.ResponseIncomplete || summary.HasError {
+		return true
+	}
+	if summary.ChunkCount <= 1 {
+		return true
+	}
+	return summary.ChunkCount%streamProgressEvery == 0
+}
+
+func summarizeStreamChunks(history []json.RawMessage, current []byte, chunkIndex int) *streamSummary {
+	summary := &streamSummary{
+		ChunkCount:        len(history) + 1,
+		HistoryChunkCount: len(history),
+		ChunkIndex:        chunkIndex,
+		CurrentChunkBytes: len(current),
+		EventTypes:        make(map[string]int),
+	}
+	for _, raw := range history {
+		body, errDecode := decodeBody(raw)
+		if errDecode != nil {
+			continue
+		}
+		applyStreamChunkSummary(summary, body)
+	}
+	applyStreamChunkSummary(summary, current)
+	if len(summary.EventTypes) == 0 {
+		summary.EventTypes = nil
+	}
+	return summary
+}
+
+func applyStreamChunkSummary(summary *streamSummary, chunk []byte) {
+	if summary == nil || len(chunk) == 0 {
+		return
+	}
+	summary.TotalKnownBytes += len(chunk)
+	for _, payload := range splitStreamPayloads(chunk) {
+		streamEvent := parseStreamPayload(payload)
+		if streamEvent.EventType == "" {
+			continue
+		}
+		summary.EventTypes[streamEvent.EventType]++
+		summary.CurrentEventType = streamEvent.EventType
+		if isTerminalStreamEvent(streamEvent.EventType) {
+			summary.TerminalEvent = streamEvent.EventType
+		}
+		if strings.Contains(streamEvent.EventType, "error") {
+			summary.HasError = true
+			if summary.ErrorType == "" {
+				summary.ErrorType = "unknown"
+			}
+		}
+		if streamEvent.FinishReason != "" {
+			summary.FinishReason = streamEvent.FinishReason
+		}
+		if streamEvent.HasError {
+			summary.HasError = true
+		}
+		if streamEvent.ErrorType != "" {
+			summary.HasError = true
+			summary.ErrorType = streamEvent.ErrorType
+		}
+		summary.OutputItemCount += streamEvent.OutputItemCount
+		summary.FunctionCallCount += streamEvent.FunctionCallCount
+		summary.ToolCallDeltaCount += streamEvent.ToolCallDeltaCount
+		summary.FunctionOutputCount += streamEvent.FunctionOutputCount
+		summary.ResponseCompleted = summary.ResponseCompleted || streamEvent.ResponseCompleted
+		summary.ResponseFailed = summary.ResponseFailed || streamEvent.ResponseFailed
+		summary.ResponseIncomplete = summary.ResponseIncomplete || streamEvent.ResponseIncomplete
+	}
+}
+
+type parsedStreamEvent struct {
+	EventType           string
+	FinishReason        string
+	HasError            bool
+	ErrorType           string
+	OutputItemCount     int
+	FunctionCallCount   int
+	ToolCallDeltaCount  int
+	FunctionOutputCount int
+	ResponseCompleted   bool
+	ResponseFailed      bool
+	ResponseIncomplete  bool
+}
+
+func splitStreamPayloads(chunk []byte) [][]byte {
+	parts := bytes.Split(chunk, []byte("\n\n"))
+	if len(parts) == 1 {
+		return [][]byte{bytes.TrimSpace(chunk)}
+	}
+	payloads := make([][]byte, 0, len(parts))
+	for _, part := range parts {
+		part = bytes.TrimSpace(part)
+		if len(part) == 0 {
+			continue
+		}
+		payloads = append(payloads, part)
+	}
+	return payloads
+}
+
+func parseStreamPayload(payload []byte) parsedStreamEvent {
+	var parsed parsedStreamEvent
+	payload = bytes.TrimSpace(payload)
+	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+		return parsed
+	}
+	if bytes.HasPrefix(payload, []byte("event:")) || bytes.HasPrefix(payload, []byte("data:")) {
+		var eventType string
+		var dataLines [][]byte
+		for _, line := range bytes.Split(payload, []byte("\n")) {
+			line = bytes.TrimSpace(line)
+			switch {
+			case bytes.HasPrefix(line, []byte("event:")):
+				eventType = strings.TrimSpace(string(bytes.TrimPrefix(line, []byte("event:"))))
+			case bytes.HasPrefix(line, []byte("data:")):
+				data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+				if len(data) > 0 && !bytes.Equal(data, []byte("[DONE]")) {
+					dataLines = append(dataLines, data)
+				}
+			}
+		}
+		parsed = parseStreamJSON(bytes.Join(dataLines, []byte("\n")))
+		if parsed.EventType == "" {
+			parsed.EventType = eventType
+		}
+		return parsed
+	}
+	return parseStreamJSON(payload)
+}
+
+func parseStreamJSON(payload []byte) parsedStreamEvent {
+	var parsed parsedStreamEvent
+	if len(payload) == 0 {
+		return parsed
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &root); err != nil {
+		return parsed
+	}
+	parsed.EventType = firstStringField(root, "type", "event")
+	parsed.FinishReason = firstFinishReason(root)
+	if rawError, ok := root["error"]; ok && len(rawError) > 0 && !bytes.Equal(rawError, []byte("null")) {
+		parsed.HasError = true
+		parsed.ErrorType = errorTypeFromRaw(rawError)
+	}
+	if strings.Contains(parsed.EventType, "error") {
+		parsed.HasError = true
+		if parsed.ErrorType == "" {
+			parsed.ErrorType = "unknown"
+		}
+	}
+	parsed.ResponseCompleted = parsed.EventType == "response.completed"
+	parsed.ResponseFailed = parsed.EventType == "response.failed"
+	parsed.ResponseIncomplete = parsed.EventType == "response.incomplete"
+	if isOutputItemEvent(parsed.EventType) {
+		parsed.OutputItemCount = 1
+	}
+	if isFunctionCallEvent(parsed.EventType, root) {
+		parsed.FunctionCallCount = 1
+	}
+	if isToolCallDeltaEvent(parsed.EventType) {
+		parsed.ToolCallDeltaCount = 1
+	}
+	if isFunctionOutputEvent(parsed.EventType, root) {
+		parsed.FunctionOutputCount = 1
+	}
+	return parsed
+}
+
+func firstStringField(root map[string]json.RawMessage, names ...string) string {
+	for _, name := range names {
+		var value string
+		if raw, ok := root[name]; ok && json.Unmarshal(raw, &value) == nil {
+			return value
+		}
+	}
+	return ""
+}
+
+func firstFinishReason(root map[string]json.RawMessage) string {
+	if finishReason := firstStringField(root, "finish_reason"); finishReason != "" {
+		return finishReason
+	}
+
+	var choices []map[string]json.RawMessage
+	if raw, ok := root["choices"]; ok && json.Unmarshal(raw, &choices) == nil {
+		for _, choice := range choices {
+			if finishReason := firstStringField(choice, "finish_reason"); finishReason != "" {
+				return finishReason
+			}
+		}
+	}
+	return ""
+}
+
+func errorTypeFromRaw(raw json.RawMessage) string {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return "unknown"
+	}
+	if errorType := firstStringField(root, "type", "code"); errorType != "" {
+		return errorType
+	}
+	return "unknown"
+}
+
+func isTerminalStreamEvent(eventType string) bool {
+	switch eventType {
+	case "response.completed", "response.failed", "response.incomplete", "error":
+		return true
+	}
+	return false
+}
+
+func isOutputItemEvent(eventType string) bool {
+	return strings.Contains(eventType, "output_item") || strings.Contains(eventType, "message")
+}
+
+func isFunctionCallEvent(eventType string, root map[string]json.RawMessage) bool {
+	if strings.Contains(eventType, "function_call") || strings.Contains(eventType, "tool_call") {
+		return true
+	}
+	return rawObjectType(root, "item") == "function_call" || rawObjectType(root, "output") == "function_call"
+}
+
+func isToolCallDeltaEvent(eventType string) bool {
+	return strings.Contains(eventType, "function_call_arguments") || strings.Contains(eventType, "tool_call_delta")
+}
+
+func isFunctionOutputEvent(eventType string, root map[string]json.RawMessage) bool {
+	if strings.Contains(eventType, "function_call_output") {
+		return true
+	}
+	return rawObjectType(root, "item") == "function_call_output" || rawObjectType(root, "output") == "function_call_output"
+}
+
+func rawObjectType(root map[string]json.RawMessage, field string) string {
+	var object map[string]json.RawMessage
+	if raw, ok := root[field]; ok && json.Unmarshal(raw, &object) == nil {
+		return firstStringField(object, "type")
+	}
+	return ""
+}
+
 func htmlManagementResponse(statusCode int, body string) managementResponse {
 	return managementResponse{
 		StatusCode: statusCode,
@@ -884,9 +1252,13 @@ func renderDebugPanel() string {
 	if settings.Enabled {
 		status = "enabled"
 	}
-	streamStatus := "disabled"
+	streamDiagnosticsStatus := "disabled"
+	if settings.Enabled && settings.StreamDiagnostics {
+		streamDiagnosticsStatus = "enabled"
+	}
+	streamChunkBodyStatus := "disabled"
 	if settings.LogStreamChunks {
-		streamStatus = "enabled"
+		streamChunkBodyStatus = "enabled"
 	}
 	bodyStatus := "disabled"
 	if settings.IncludeBody {
@@ -910,17 +1282,19 @@ func renderDebugPanel() string {
 <body>
 <main>
 <h1>OpenAI Tool Order Repair</h1>
-<p class="muted">Debug panel for request repair, response records, and stream chunk records.</p>
+<p class="muted">Debug panel for request repair records, response records, and compact response-stream summaries.</p>
 <section class="grid">
 <div><strong>Version</strong><span>` + html.EscapeString(pluginVersion) + `</span></div>
 <div><strong>Debug</strong><span>` + html.EscapeString(status) + `</span></div>
 <div><strong>Log path</strong><span>` + html.EscapeString(settings.LogPath) + `</span></div>
 <div><strong>Log bytes</strong><span>` + strconv.FormatInt(totalBytes, 10) + `</span></div>
 <div><strong>Include bodies</strong><span>` + html.EscapeString(bodyStatus) + `</span></div>
-<div><strong>Stream chunks</strong><span>` + html.EscapeString(streamStatus) + `</span></div>
+<div><strong>Stream diagnostics</strong><span>` + html.EscapeString(streamDiagnosticsStatus) + `</span></div>
+<div><strong>Stream chunks/full bodies</strong><span>` + html.EscapeString(streamChunkBodyStatus) + `</span></div>
 <div><strong>Max body bytes</strong><span>` + strconv.Itoa(settings.MaxBodyBytes) + `</span></div>
 <div><strong>Displayed tail</strong><span>` + strconv.Itoa(debugPanelTailBytes) + ` bytes</span></div>
 </section>
+<p class="muted">Stream diagnostics are compact summaries only. Request/response bodies, headers, and full stream chunk bodies are not logged unless body logging is explicitly enabled.</p>
 <section class="actions">
 <form method="get"><button type="submit">Refresh</button></form>
 <form method="post" onsubmit="return confirm('Clear debug log?');"><button type="submit" class="danger">Clear log</button></form>
