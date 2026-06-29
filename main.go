@@ -47,6 +47,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -60,9 +61,16 @@ const abiVersion uint32 = 1
 
 const (
 	pluginID            = "openai-tool-order-repair"
-	pluginVersion       = "0.1.1"
+	pluginVersion       = "0.1.2"
 	defaultDebugLogPath = "logs/openai-tool-order-repair-debug.jsonl"
 	defaultMaxBodyBytes = 256 * 1024
+	debugPanelTailBytes = 512 * 1024
+)
+
+const (
+	httpStatusOK                  = 200
+	httpStatusNotFound            = 404
+	httpStatusInternalServerError = 500
 )
 
 var debugMu sync.Mutex
@@ -142,6 +150,30 @@ type streamChunkInterceptRequest struct {
 }
 
 type streamChunkInterceptResponse struct{}
+
+type managementRegistration struct {
+	Resources []resourceRoute `json:"resources,omitempty"`
+}
+
+type resourceRoute struct {
+	Path        string `json:"Path"`
+	Menu        string `json:"Menu"`
+	Description string `json:"Description"`
+}
+
+type managementRequest struct {
+	Method  string              `json:"Method"`
+	Path    string              `json:"Path"`
+	Headers map[string][]string `json:"Headers"`
+	Query   map[string][]string `json:"Query"`
+	Body    json.RawMessage     `json:"Body"`
+}
+
+type managementResponse struct {
+	StatusCode int                 `json:"StatusCode"`
+	Headers    map[string][]string `json:"Headers,omitempty"`
+	Body       []byte              `json:"Body,omitempty"`
+}
 
 type debugRecord struct {
 	Time              string              `json:"time"`
@@ -243,13 +275,48 @@ func handleMethod(method string, rawRequest []byte) ([]byte, error) {
 		return interceptOpenAIResponse(rawRequest)
 	case "response.intercept_stream_chunk":
 		return interceptOpenAIStreamChunk(rawRequest)
+	case "management.register":
+		return registerManagementPanel()
+	case "management.handle":
+		return handleManagementRequest(rawRequest)
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
 }
 
 func pluginRegistration() ([]byte, error) {
-	return okEnvelopeJSON(`{"schema_version":1,"metadata":{"Name":"openai-tool-order-repair","Version":"` + pluginVersion + `","Author":"MEIZU16","GitHubRepository":"https://github.com/MEIZU16/cpa-plugin-openai-tool-order-repair","Logo":"","ConfigFields":[{"Name":"debug","Type":"boolean","Description":"Write detailed request and response debug records."},{"Name":"debug_log_path","Type":"string","Description":"Path for JSONL debug records. Relative paths are resolved from the CLIProxyAPI working directory."},{"Name":"debug_include_body","Type":"boolean","Description":"Include request and response bodies in debug records. Sensitive data may be logged."},{"Name":"debug_log_stream_chunks","Type":"boolean","Description":"Log streaming response chunks when debug is enabled."},{"Name":"debug_max_body_bytes","Type":"integer","Description":"Maximum bytes stored for each logged body field."}]},"capabilities":{"request_interceptor":true,"response_interceptor":true,"response_stream_interceptor":true}}`)
+	return okEnvelopeJSON(`{"schema_version":1,"metadata":{"Name":"openai-tool-order-repair","Version":"` + pluginVersion + `","Author":"MEIZU16","GitHubRepository":"https://github.com/MEIZU16/cpa-plugin-openai-tool-order-repair","Logo":"","ConfigFields":[{"Name":"debug","Type":"boolean","Description":"Write detailed request and response debug records."},{"Name":"debug_log_path","Type":"string","Description":"Path for JSONL debug records. Relative paths are resolved from the CLIProxyAPI working directory."},{"Name":"debug_include_body","Type":"boolean","Description":"Include request and response bodies in debug records. Sensitive data may be logged."},{"Name":"debug_log_stream_chunks","Type":"boolean","Description":"Log streaming response chunks when debug is enabled."},{"Name":"debug_max_body_bytes","Type":"integer","Description":"Maximum bytes stored for each logged body field."}]},"capabilities":{"request_interceptor":true,"response_interceptor":true,"response_stream_interceptor":true,"management_api":true}}`)
+}
+
+func registerManagementPanel() ([]byte, error) {
+	return okEnvelopeValue(managementRegistration{Resources: []resourceRoute{{
+		Path:        "/debug",
+		Menu:        "OpenAI Tool Order Repair",
+		Description: "View and clear OpenAI tool order repair debug records.",
+	}}})
+}
+
+func handleManagementRequest(rawRequest []byte) ([]byte, error) {
+	var req managementRequest
+	if err := json.Unmarshal(rawRequest, &req); err != nil {
+		return nil, fmt.Errorf("decode management request: %w", err)
+	}
+
+	switch strings.ToUpper(req.Method) {
+	case "GET":
+		return okEnvelopeValue(htmlManagementResponse(httpStatusOK, renderDebugPanel()))
+	case "POST":
+		settings := currentDebugSettings()
+		if err := os.MkdirAll(filepath.Dir(settings.LogPath), 0o755); err != nil {
+			return okEnvelopeValue(htmlManagementResponse(httpStatusInternalServerError, renderMessagePage("Failed to prepare debug log directory", err.Error())))
+		}
+		if err := os.WriteFile(settings.LogPath, nil, 0o644); err != nil {
+			return okEnvelopeValue(htmlManagementResponse(httpStatusInternalServerError, renderMessagePage("Failed to clear debug log", err.Error())))
+		}
+		return okEnvelopeValue(htmlManagementResponse(httpStatusOK, renderMessagePage("Debug log cleared", "The debug log file has been truncated.")))
+	}
+
+	return okEnvelopeValue(htmlManagementResponse(httpStatusNotFound, renderMessagePage("Not found", "Unknown debug panel route.")))
 }
 
 func applyDebugConfig(rawRequest []byte) {
@@ -739,6 +806,133 @@ func debugBodyValue(body []byte) any {
 		return parsed
 	}
 	return string(body)
+}
+
+func htmlManagementResponse(statusCode int, body string) managementResponse {
+	return managementResponse{
+		StatusCode: statusCode,
+		Headers: map[string][]string{
+			"Content-Type": {"text/html; charset=utf-8"},
+		},
+		Body: []byte(body),
+	}
+}
+
+func renderDebugPanel() string {
+	settings := currentDebugSettings()
+	logTail, totalBytes, errRead := readDebugLogTail(settings.LogPath, debugPanelTailBytes)
+	status := "disabled"
+	if settings.Enabled {
+		status = "enabled"
+	}
+	streamStatus := "disabled"
+	if settings.LogStreamChunks {
+		streamStatus = "enabled"
+	}
+	bodyStatus := "disabled"
+	if settings.IncludeBody {
+		bodyStatus = "enabled"
+	}
+
+	logView := logTail
+	if errRead != nil {
+		logView = "Unable to read debug log: " + errRead.Error()
+	} else if logView == "" {
+		logView = "No debug records yet."
+	}
+
+	return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>OpenAI Tool Order Repair Debug</title>
+<style>` + managementPanelCSS() + `</style>
+</head>
+<body>
+<main>
+<h1>OpenAI Tool Order Repair</h1>
+<p class="muted">Debug panel for request repair, response records, and stream chunk records.</p>
+<section class="grid">
+<div><strong>Version</strong><span>` + html.EscapeString(pluginVersion) + `</span></div>
+<div><strong>Debug</strong><span>` + html.EscapeString(status) + `</span></div>
+<div><strong>Log path</strong><span>` + html.EscapeString(settings.LogPath) + `</span></div>
+<div><strong>Log bytes</strong><span>` + strconv.FormatInt(totalBytes, 10) + `</span></div>
+<div><strong>Include bodies</strong><span>` + html.EscapeString(bodyStatus) + `</span></div>
+<div><strong>Stream chunks</strong><span>` + html.EscapeString(streamStatus) + `</span></div>
+<div><strong>Max body bytes</strong><span>` + strconv.Itoa(settings.MaxBodyBytes) + `</span></div>
+<div><strong>Displayed tail</strong><span>` + strconv.Itoa(debugPanelTailBytes) + ` bytes</span></div>
+</section>
+<section class="actions">
+<form method="get"><button type="submit">Refresh</button></form>
+<form method="post" onsubmit="return confirm('Clear debug log?');"><button type="submit" class="danger">Clear log</button></form>
+</section>
+<section>
+<h2>Recent JSONL records</h2>
+<pre>` + html.EscapeString(logView) + `</pre>
+</section>
+</main>
+</body>
+</html>`
+}
+
+func renderMessagePage(title, message string) string {
+	return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>` + html.EscapeString(title) + `</title>
+<style>` + managementPanelCSS() + `</style>
+</head>
+<body>
+<main>
+<h1>` + html.EscapeString(title) + `</h1>
+<p>` + html.EscapeString(message) + `</p>
+<p><a href="debug">Back to debug panel</a></p>
+</main>
+</body>
+</html>`
+}
+
+func managementPanelCSS() string {
+	return `body{margin:0;background:#0f172a;color:#e2e8f0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{max-width:1100px;margin:0 auto;padding:32px}h1{margin:0 0 8px;font-size:28px}h2{margin-top:28px}.muted{color:#94a3b8}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin:24px 0}.grid div{background:#111827;border:1px solid #334155;border-radius:12px;padding:14px}.grid strong{display:block;color:#94a3b8;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.grid span{display:block;margin-top:8px;overflow-wrap:anywhere}.actions{display:flex;gap:12px;margin:20px 0}button{border:0;border-radius:10px;padding:10px 16px;background:#2563eb;color:white;cursor:pointer}button.danger{background:#dc2626}pre{white-space:pre-wrap;word-break:break-word;background:#020617;border:1px solid #334155;border-radius:12px;padding:16px;max-height:70vh;overflow:auto}a{color:#93c5fd}`
+}
+
+func readDebugLogTail(path string, maxBytes int) (string, int64, error) {
+	if maxBytes <= 0 {
+		maxBytes = debugPanelTailBytes
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", 0, nil
+		}
+		return "", 0, err
+	}
+	if info.IsDir() {
+		return "", info.Size(), fmt.Errorf("debug log path is a directory")
+	}
+	size := info.Size()
+	if size <= int64(maxBytes) {
+		raw, errRead := os.ReadFile(path)
+		if errRead != nil {
+			return "", size, errRead
+		}
+		return string(raw), size, nil
+	}
+
+	file, errOpen := os.Open(path)
+	if errOpen != nil {
+		return "", size, errOpen
+	}
+	defer func() { _ = file.Close() }()
+
+	buf := make([]byte, maxBytes)
+	start := size - int64(maxBytes)
+	n, errRead := file.ReadAt(buf, start)
+	if errRead != nil && n == 0 {
+		return "", size, errRead
+	}
+	return "... truncated; showing last " + strconv.Itoa(maxBytes) + " bytes ...\n" + string(buf[:n]), size, nil
 }
 
 func okEnvelopeJSON(result string) ([]byte, error) {

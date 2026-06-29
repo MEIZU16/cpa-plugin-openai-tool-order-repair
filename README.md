@@ -90,6 +90,16 @@ host at:
 Warning: `debug_include_body: true` may record prompts, responses, headers, and
 tool payloads. Disable it or reduce `debug_max_body_bytes` when sharing logs.
 
+## Management debug panel
+
+Version `0.1.2` adds a Management API page for the debug log. After installing
+or updating the plugin and restarting CLIProxyAPI, open the plugin menu entry
+named `OpenAI Tool Order Repair` in the management UI.
+
+The panel shows the current debug settings, the configured log path, the recent
+tail of the JSONL log file, and a button to clear the log. It reads at most the
+last 512 KiB of the log file to avoid loading very large logs into the browser.
+
 ## Build locally
 
 ```bash
@@ -106,7 +116,7 @@ openai-tool-order-repair_<version>_<goos>_<goarch>.zip
 checksums.txt
 ```
 
-For Linux amd64 version `0.1.1`, the zip must contain this file at the zip root:
+For Linux amd64 version `0.1.2`, the zip must contain this file at the zip root:
 
 ```text
 openai-tool-order-repair.so
@@ -115,5 +125,5 @@ openai-tool-order-repair.so
 Create release assets with:
 
 ```bash
-./scripts/package_release.sh 0.1.1 linux amd64
+./scripts/package_release.sh 0.1.2 linux amd64
 ```

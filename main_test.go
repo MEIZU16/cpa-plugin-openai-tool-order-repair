@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -89,6 +90,49 @@ func TestRepairOpenAIToolMessageOrderRepairsResponsesInput(t *testing.T) {
 	}
 	if input[1].Type != "function_call_output" || input[1].CallID != "call_1" {
 		t.Fatalf("input[1] = %+v, want function_call_output call_1", input[1])
+	}
+}
+
+func TestManagementPanelRegistersAndRenders(t *testing.T) {
+	registrationRaw, err := handleMethod("management.register", nil)
+	if err != nil {
+		t.Fatalf("management.register returned error: %v", err)
+	}
+	var registrationEnvelope envelope
+	if err := json.Unmarshal(registrationRaw, &registrationEnvelope); err != nil {
+		t.Fatalf("decode management.register envelope: %v", err)
+	}
+	if !registrationEnvelope.OK {
+		t.Fatalf("management.register ok = false, error = %+v", registrationEnvelope.Error)
+	}
+	var registration managementRegistration
+	if err := json.Unmarshal(registrationEnvelope.Result, &registration); err != nil {
+		t.Fatalf("decode management registration: %v", err)
+	}
+	if len(registration.Resources) != 1 || registration.Resources[0].Path != "/debug" {
+		t.Fatalf("registration resources = %+v, want /debug", registration.Resources)
+	}
+
+	responseRaw, err := handleMethod("management.handle", []byte(`{"Method":"GET","Path":"/debug"}`))
+	if err != nil {
+		t.Fatalf("management.handle returned error: %v", err)
+	}
+	var responseEnvelope envelope
+	if err := json.Unmarshal(responseRaw, &responseEnvelope); err != nil {
+		t.Fatalf("decode management.handle envelope: %v", err)
+	}
+	if !responseEnvelope.OK {
+		t.Fatalf("management.handle ok = false, error = %+v", responseEnvelope.Error)
+	}
+	var response managementResponse
+	if err := json.Unmarshal(responseEnvelope.Result, &response); err != nil {
+		t.Fatalf("decode management response: %v", err)
+	}
+	if response.StatusCode != httpStatusOK {
+		t.Fatalf("StatusCode = %d, want %d", response.StatusCode, httpStatusOK)
+	}
+	if !strings.Contains(string(response.Body), "OpenAI Tool Order Repair") {
+		t.Fatalf("management response body does not contain panel title: %s", string(response.Body))
 	}
 }
 
